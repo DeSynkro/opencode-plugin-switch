@@ -1,0 +1,460 @@
+#!/usr/bin/env node
+'use strict'
+
+/*
+ * ops - opencode plugin / skill switch
+ *
+ * Moves plugins and skills between the live OpenCode config directories and a
+ * .disabled store next to them. The folder layout is the record: nothing else
+ * is written, and every move is a single rename() on the same filesystem.
+ */
+
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { spawnSync } = require('node:child_process')
+const readline = require('node:readline')
+
+const VERSION = '0.1.0'
+
+const CONFIG = path.join(
+  process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+  'opencode'
+)
+const LIVE = {
+  plugin: path.join(CONFIG, 'plugins'),
+  skill: path.join(CONFIG, 'skills')
+}
+const DISABLED = {
+  plugin: path.join(CONFIG, '.disabled', 'plugins'),
+  skill: path.join(CONFIG, '.disabled', 'skills')
+}
+
+const C = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  cyan: '\x1b[38;2;108;182;255m',
+  green: '\x1b[38;2;126;203;160m',
+  gray: '\x1b[38;2;127;140;155m',
+  yellow: '\x1b[38;2;224;192;125m',
+  red: '\x1b[38;2;224;108;117m',
+  white: '\x1b[38;2;214;225;238m'
+}
+
+function bootstrap() {
+  const dirs = [
+    CONFIG,
+    LIVE.plugin,
+    LIVE.skill,
+    path.dirname(DISABLED.plugin),
+    DISABLED.plugin,
+    DISABLED.skill
+  ]
+  for (const dir of dirs) fs.mkdirSync(dir, { recursive: true })
+}
+
+function entries(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return []
+  }
+}
+
+function isFile(target) {
+  try {
+    return fs.statSync(target).isFile()
+  } catch {
+    return false
+  }
+}
+
+function isDirectory(target) {
+  try {
+    return fs.statSync(target).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function isPluginEntry(entry, full) {
+  if (entry.isDirectory() || entry.isSymbolicLink()) return true
+  if (entry.isFile() && /\.(?:[cm]?[jt]s)$/.test(entry.name)) return true
+  return isDirectory(full) || isFile(full)
+}
+
+function skillId(name, full) {
+  if (name.endsWith('.md') && isFile(full)) return name.slice(0, -3)
+  if (isDirectory(full) && isFile(path.join(full, 'SKILL.md'))) return name
+  return null
+}
+
+function collect() {
+  const items = []
+  for (const kind of ['plugin', 'skill']) {
+    const seen = new Set()
+    for (const enabled of [true, false]) {
+      const dir = enabled ? LIVE[kind] : DISABLED[kind]
+      for (const entry of entries(dir)) {
+        if (entry.name.startsWith('.') || entry.name === 'node_modules') continue
+        const full = path.join(dir, entry.name)
+        let id = null
+        if (kind === 'plugin') {
+          if (isPluginEntry(entry, full)) id = entry.name
+        } else {
+          id = skillId(entry.name, full)
+        }
+        if (!id || !id.trim() || seen.has(id)) continue
+        seen.add(id)
+        items.push({ kind, id, path: full, enabled, was: enabled })
+      }
+    }
+  }
+
+  items.sort((a, b) => {
+    if (a.kind !== b.kind) return a.kind === 'plugin' ? -1 : 1
+    return a.id.localeCompare(b.id, undefined, { sensitivity: 'base' })
+  })
+  items.forEach((item, index) => {
+    item.index = index
+  })
+  return items
+}
+
+function apply(items) {
+  const result = {
+    enabled: { plugin: 0, skill: 0 },
+    disabled: { plugin: 0, skill: 0 },
+    errors: []
+  }
+
+  for (const item of items) {
+    if (item.enabled === item.was) continue
+    const base = path.basename(item.path)
+    const from = path.join(item.was ? LIVE[item.kind] : DISABLED[item.kind], base)
+    const to = path.join(item.enabled ? LIVE[item.kind] : DISABLED[item.kind], base)
+
+    try {
+      if (!fs.existsSync(from)) throw new Error('missing source: ' + from)
+      if (fs.existsSync(to)) throw new Error('already exists: ' + to)
+      fs.renameSync(from, to)
+      item.path = to
+      item.was = item.enabled
+      if (item.enabled) result.enabled[item.kind]++
+      else result.disabled[item.kind]++
+    } catch (error) {
+      result.errors.push(item.id + ': ' + error.message)
+    }
+  }
+
+  return result
+}
+
+function phrase(count, word) {
+  return count + ' ' + word + (count === 1 ? '' : 's')
+}
+
+function joinParts(parts) {
+  if (parts.length <= 1) return parts.join('')
+  return parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1]
+}
+
+function tui(items) {
+  return new Promise((resolve) => {
+    const stdin = process.stdin
+    const stdout = process.stdout
+    const wasRaw = Boolean(stdin.isRaw)
+
+    let cursor = 0
+    let offset = 0
+    let status = ''
+    let closed = false
+
+    function cleanup() {
+      if (closed) return
+      closed = true
+      try {
+        stdin.setRawMode(wasRaw)
+      } catch {}
+      stdin.pause()
+      stdin.removeListener('data', onData)
+      process.removeListener('SIGWINCH', render)
+      process.removeListener('exit', cleanup)
+      stdout.write(C.reset + '\x1b[?25h\r\n')
+    }
+
+    function finish(action) {
+      cleanup()
+      resolve({ action, items })
+    }
+
+    function render() {
+      const rows = []
+      for (const kind of ['plugin', 'skill']) {
+        const group = items.filter((item) => item.kind === kind)
+        const on = group.filter((item) => item.enabled).length
+        rows.push({ type: 'header', kind, on, total: group.length })
+        if (group.length === 0) rows.push({ type: 'empty' })
+        for (const item of group) rows.push({ type: 'item', item })
+      }
+
+      const cursorRow = rows.findIndex(
+        (row) => row.type === 'item' && row.item.index === cursor
+      )
+      const termRows = stdout.rows || 24
+      const fixedLines = 6
+      const visible = Math.max(4, termRows - fixedLines)
+
+      if (cursorRow < offset) offset = cursorRow
+      if (cursorRow >= offset + visible) offset = cursorRow - visible + 1
+      const maxOffset = Math.max(0, rows.length - visible)
+      if (offset > maxOffset) offset = maxOffset
+      if (offset < 0) offset = 0
+
+      const changes = items.filter((item) => item.enabled !== item.was).length
+      const lines = []
+
+      lines.push(
+        C.bold + C.cyan + 'opencode plugin / skill switch' + C.reset +
+          C.dim + '  v' + VERSION + C.reset
+      )
+      lines.push(C.gray + CONFIG + C.reset)
+      lines.push('')
+
+      for (const row of rows.slice(offset, offset + visible)) {
+        if (row.type === 'header') {
+          const label = row.kind === 'plugin' ? 'Plugins' : 'Skills'
+          lines.push(
+            C.bold + C.cyan + label + C.reset +
+              '  ' + C.gray + row.on + '/' + row.total + ' on' + C.reset
+          )
+        } else if (row.type === 'empty') {
+          lines.push('  ' + C.dim + '(none)' + C.reset)
+        } else {
+          const item = row.item
+          const pointed = item.index === cursor
+          const marker = pointed ? C.cyan + '> ' + C.reset : '  '
+          const box = item.enabled ? C.green + '[x]' + C.reset : C.gray + '[ ]' + C.reset
+          let name
+          if (pointed) name = C.bold + C.white + item.id + C.reset
+          else if (item.enabled) name = C.white + item.id + C.reset
+          else name = C.gray + item.id + C.reset
+          lines.push(marker + box + ' ' + name)
+        }
+      }
+
+      lines.push('')
+      lines.push(
+        C.dim +
+          'up/down or j/k move   space toggle   a all on   n all off   enter apply   q quit' +
+          C.reset
+      )
+      const pending =
+        changes === 0
+          ? C.dim + 'no pending changes' + C.reset
+          : C.yellow + changes + ' pending change' + (changes === 1 ? '' : 's') + C.reset
+      lines.push(pending + (status ? '   ' + C.red + status + C.reset : ''))
+
+      let out = '\x1b[H'
+      for (const line of lines) out += '\x1b[2K' + line + '\r\n'
+      out += '\x1b[2K\x1b[J'
+      stdout.write(out)
+    }
+
+    function onData(chunk) {
+      status = ''
+      if (chunk === '\u0003' || chunk === 'q' || chunk === '\x1b') return finish('quit')
+      if (chunk === '\x1b[A' || chunk === 'k') cursor = Math.max(0, cursor - 1)
+      else if (chunk === '\x1b[B' || chunk === 'j') cursor = Math.min(items.length - 1, cursor + 1)
+      else if (chunk === ' ') items[cursor].enabled = !items[cursor].enabled
+      else if (chunk === 'a') items.forEach((item) => (item.enabled = true))
+      else if (chunk === 'n') items.forEach((item) => (item.enabled = false))
+      else if (chunk === '\r' || chunk === '\n') return finish('apply')
+      else return
+      render()
+    }
+
+    stdin.on('data', onData)
+    process.on('SIGWINCH', render)
+    process.on('exit', cleanup)
+
+    stdin.setRawMode(true)
+    stdin.resume()
+    stdin.setEncoding('utf8')
+    stdout.write('\x1b[?25l')
+    render()
+  })
+}
+
+function ask(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+    rl.question(question, (answer) => {
+      rl.close()
+      resolve(answer.trim().toLowerCase())
+    })
+  })
+}
+
+function printList() {
+  const items = collect()
+  if (items.length === 0) {
+    console.log('No plugins or skills found in ' + CONFIG)
+    return
+  }
+  const sections = [
+    ['plugin', 'PLUGINS'],
+    ['skill', 'SKILLS']
+  ]
+  const chunks = []
+  for (const [kind, title] of sections) {
+    const group = items.filter((item) => item.kind === kind)
+    if (group.length === 0) continue
+    chunks.push(title)
+    for (const item of group) {
+      chunks.push('  ' + (item.enabled ? 'on ' : 'off') + '  ' + item.id)
+    }
+  }
+  console.log(chunks.join('\n'))
+}
+
+function install() {
+  const dir = path.join(os.homedir(), '.local', 'bin')
+  const target = path.join(dir, 'ops')
+  const self = fs.realpathSync(__filename)
+
+  fs.mkdirSync(dir, { recursive: true })
+
+  try {
+    const existing = fs.lstatSync(target)
+    if (existing.isSymbolicLink() && fs.readlinkSync(target) === self) {
+      console.log('Already installed: ' + target + ' -> ' + self)
+      return 0
+    }
+    console.error('Refusing to overwrite existing ' + target + '. Remove it first.')
+    return 1
+  } catch {}
+
+  fs.symlinkSync(self, target)
+  console.log('Linked ' + target + ' -> ' + self)
+  return 0
+}
+
+function printHelp() {
+  console.log(
+    [
+      'ops - opencode plugin / skill switch ' + VERSION,
+      '',
+      'Usage:',
+      '  ops              interactive switch',
+      '  ops --list       plain on/off list',
+      '  ops --install    symlink into ~/.local/bin/ops',
+      '  ops --version    print version',
+      '  ops --help       this text',
+      '',
+      'Keys:',
+      '  up/down, j/k   move',
+      '  space          toggle highlighted item',
+      '  a              turn all on',
+      '  n              turn all off',
+      '  enter          apply',
+      '  q, esc         quit without changes',
+      '',
+      'Paths:',
+      '  live:      ' + LIVE.plugin + ', ' + LIVE.skill,
+      '  disabled:  ' + DISABLED.plugin + ', ' + DISABLED.skill
+    ].join('\n')
+  )
+}
+
+async function main(argv) {
+  const args = argv.slice(2)
+
+  if (args.includes('--help') || args.includes('-h')) {
+    printHelp()
+    return 0
+  }
+  if (args.includes('--version') || args.includes('-v')) {
+    console.log('opencode-plugin-switch ' + VERSION)
+    return 0
+  }
+  if (args.includes('--install')) return install()
+  if (args.includes('--list')) {
+    printList()
+    return 0
+  }
+
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error('ops needs an interactive terminal. Use --list for plain output.')
+    return 1
+  }
+
+  bootstrap()
+  const items = collect()
+  if (items.length === 0) {
+    console.log(
+      'Nothing found in ' + CONFIG + '\n' +
+        'Add plugins to plugins/ or skills to skills/ and run again.'
+    )
+    return 0
+  }
+
+  const { action } = await tui(items)
+
+  if (action === 'quit') {
+    const pending = items.filter((item) => item.enabled !== item.was).length
+    console.log(
+      pending
+        ? 'Cancelled. ' + phrase(pending, 'pending change') + ' discarded.'
+        : 'Cancelled. No changes.'
+    )
+    return 0
+  }
+
+  const result = apply(items)
+  const disabledParts = []
+  const enabledParts = []
+  if (result.disabled.plugin) disabledParts.push(phrase(result.disabled.plugin, 'plugin'))
+  if (result.disabled.skill) disabledParts.push(phrase(result.disabled.skill, 'skill'))
+  if (result.enabled.plugin) enabledParts.push(phrase(result.enabled.plugin, 'plugin'))
+  if (result.enabled.skill) enabledParts.push(phrase(result.enabled.skill, 'skill'))
+
+  if (disabledParts.length) {
+    console.log(
+      'Disabled ' + joinParts(disabledParts) + '. Moved to ' + path.dirname(DISABLED.plugin) + '/'
+    )
+  }
+  if (enabledParts.length) {
+    console.log('Enabled ' + joinParts(enabledParts) + '. Moved back into ' + CONFIG + '/')
+  }
+  if (result.errors.length) {
+    for (const error of result.errors) console.error(C.red + error + C.reset)
+  }
+  if (!disabledParts.length && !enabledParts.length && !result.errors.length) {
+    console.log('No changes.')
+    return 0
+  }
+
+  if (disabledParts.length || enabledParts.length) {
+    const answer = await ask('Reload OpenCode now? [y/N] ')
+    if (answer === 'y' || answer === 'yes') {
+      const reload = spawnSync('opencode', ['service', 'restart'], { stdio: 'inherit' })
+      if (reload.error) {
+        console.error('Could not run opencode: ' + reload.error.message)
+        console.error('Run /reload inside OpenCode instead.')
+      }
+    } else {
+      console.log('Run /reload inside OpenCode when you are ready.')
+    }
+  }
+
+  return result.errors.length ? 1 : 0
+}
+
+main(process.argv)
+  .then((code) => process.exit(code))
+  .catch((error) => {
+    console.error(error && error.stack ? error.stack : String(error))
+    process.exit(1)
+  })
